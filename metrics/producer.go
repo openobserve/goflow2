@@ -1,25 +1,28 @@
 package metrics
 
 import (
+	"fmt"
 	"net/netip"
 
-	"github.com/netsampler/goflow2/v2/decoders/netflow"
-	"github.com/netsampler/goflow2/v2/decoders/netflowlegacy"
-	"github.com/netsampler/goflow2/v2/decoders/sflow"
-	flowmessage "github.com/netsampler/goflow2/v2/pb"
-	"github.com/netsampler/goflow2/v2/producer"
+	"github.com/netsampler/goflow2/v3/decoders/netflow"
+	"github.com/netsampler/goflow2/v3/decoders/netflowlegacy"
+	"github.com/netsampler/goflow2/v3/decoders/sflow"
+	"github.com/netsampler/goflow2/v3/producer"
+	"github.com/netsampler/goflow2/v3/producer/proto"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// PromProducerWrapper wraps a producer to emit Prometheus metrics.
 type PromProducerWrapper struct {
 	wrapped producer.ProducerInterface
 }
 
+// Produce forwards to the wrapped producer and updates metrics.
 func (p *PromProducerWrapper) Produce(msg interface{}, args *producer.ProduceArgs) ([]producer.ProducerMessage, error) {
 	flowMessageSet, err := p.wrapped.Produce(msg, args)
 	if err != nil {
-		return flowMessageSet, err
+		return flowMessageSet, fmt.Errorf("metrics producer: %w", err)
 	}
 	key := args.Src.Addr().Unmap().String()
 	var nfvariant bool
@@ -116,32 +119,35 @@ func (p *PromProducerWrapper) Produce(msg interface{}, args *producer.ProduceArg
 
 	if nfvariant {
 		for _, msg := range flowMessageSet {
-			fmsg, ok := msg.(*flowmessage.FlowMessage)
+			fmsg, ok := msg.(*protoproducer.ProtoProducerMessage)
 			if !ok {
 				continue
 			}
 			timeDiff := fmsg.TimeReceivedNs - fmsg.TimeFlowEndNs
+
 			NetFlowTimeStatsSum.With(
 				prometheus.Labels{
 					"router":  key,
 					"version": versionStr,
 				}).
-				Observe(float64(timeDiff))
+				Observe(float64(timeDiff) / 1e9)
 		}
 	}
 
-	return flowMessageSet, err
+	return flowMessageSet, nil
 }
 
+// Close forwards Close to the wrapped producer.
 func (p *PromProducerWrapper) Close() {
 	p.wrapped.Close()
 }
 
+// Commit forwards Commit to the wrapped producer.
 func (p *PromProducerWrapper) Commit(flowMessageSet []producer.ProducerMessage) {
 	p.wrapped.Commit(flowMessageSet)
 }
 
-// Wraps a producer with metrics
+// WrapPromProducer wraps a producer with metrics reporting.
 func WrapPromProducer(wrapped producer.ProducerInterface) producer.ProducerInterface {
 	return &PromProducerWrapper{
 		wrapped: wrapped,

@@ -4,17 +4,19 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
 	reuseport "github.com/libp2p/go-reuseport"
 )
 
+// ReceiverCallback is notified when packets are dropped.
 type ReceiverCallback interface {
 	Dropped(msg Message)
 }
 
-// Callback used to decode a UDP message
+// DecoderFunc decodes a received UDP message.
 type DecoderFunc func(msg interface{}) error
 
 type udpPacket struct {
@@ -25,11 +27,20 @@ type udpPacket struct {
 	received time.Time
 }
 
+// Message carries a received UDP payload and metadata.
 type Message struct {
 	Src      netip.AddrPort
 	Dst      netip.AddrPort
 	Payload  []byte
 	Received time.Time
+}
+
+func normalizeAddrPort(addrPort netip.AddrPort) netip.AddrPort {
+	addr := addrPort.Addr()
+	if addr.Is4In6() {
+		return netip.AddrPortFrom(addr.Unmap(), addrPort.Port())
+	}
+	return addrPort
 }
 
 var packetPool = sync.Pool{
@@ -40,15 +51,18 @@ var packetPool = sync.Pool{
 	},
 }
 
+// UDPReceiver receives UDP packets and dispatches them to decoders.
 type UDPReceiver struct {
 	ready    chan bool
-	q        chan bool
-	wg       *sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	recvWg   *sync.WaitGroup
+	decodeWg *sync.WaitGroup
 	dispatch chan *udpPacket
 	errCh    chan error // linked to receiver, never closed
 
-	decodersCnt int
-	blocking    bool
+	blocking     bool
+	dispatchSize int
 
 	workers int
 	sockets int
@@ -56,6 +70,7 @@ type UDPReceiver struct {
 	cb ReceiverCallback
 }
 
+// UDPReceiverConfig configures UDP receiver workers and sockets.
 type UDPReceiverConfig struct {
 	Workers   int
 	Sockets   int
@@ -65,13 +80,15 @@ type UDPReceiverConfig struct {
 	ReceiverCallback ReceiverCallback
 }
 
+// NewUDPReceiver creates a UDP receiver with the provided configuration.
 func NewUDPReceiver(cfg *UDPReceiverConfig) (*UDPReceiver, error) {
 	r := &UDPReceiver{
-		wg:      &sync.WaitGroup{},
-		sockets: 2,
-		workers: 2,
-		ready:   make(chan bool),
-		errCh:   make(chan error),
+		recvWg:   &sync.WaitGroup{},
+		decodeWg: &sync.WaitGroup{},
+		sockets:  2,
+		workers:  2,
+		ready:    make(chan bool),
+		errCh:    make(chan error),
 	}
 
 	dispatchSize := 1000000
@@ -90,24 +107,26 @@ func NewUDPReceiver(cfg *UDPReceiverConfig) (*UDPReceiver, error) {
 		r.blocking = cfg.Blocking
 		r.cb = cfg.ReceiverCallback
 	}
-
-	if dispatchSize == 0 {
-		r.dispatch = make(chan *udpPacket) // synchronous mode
-	} else {
-		r.dispatch = make(chan *udpPacket, dispatchSize)
-	}
+	r.dispatchSize = dispatchSize
 
 	err := r.init()
 
-	return r, err
+	if err != nil {
+		return nil, fmt.Errorf("udp receiver init: %w", err)
+	}
+	return r, nil
 }
 
 // Initialize channels that are related to a session
 // Once the user calls Stop, they can restart the capture
 func (r *UDPReceiver) init() error {
-
-	r.q = make(chan bool)
-	r.decodersCnt = 0
+	r.stopCh = make(chan struct{})
+	r.stopOnce = sync.Once{}
+	if r.dispatchSize == 0 {
+		r.dispatch = make(chan *udpPacket) // synchronous mode
+	} else {
+		r.dispatch = make(chan *udpPacket, r.dispatchSize)
+	}
 	select {
 	case <-r.ready:
 		return fmt.Errorf("receiver is already stopped")
@@ -124,32 +143,53 @@ func (r *UDPReceiver) logError(err error) {
 	}
 }
 
+// Errors returns a channel of receiver errors.
 func (r *UDPReceiver) Errors() <-chan error {
 	return r.errCh
 }
 
 func (r *UDPReceiver) receive(addr string, port int, started chan bool) error {
-	pconn, err := reuseport.ListenPacket("udp", fmt.Sprintf("%s:%d", addr, port))
-	close(started)
-	if err != nil {
-		return err
+	if strings.ContainsRune(addr, ':') && !strings.ContainsRune(addr, '[') {
+		addr = "[" + addr + "]"
 	}
 
-	q := make(chan bool)
-	// function to quit
+	pconn, err := reuseport.ListenPacket("udp", fmt.Sprintf("%s:%d", addr, port))
+	if err != nil {
+		return fmt.Errorf("udp listen %s:%d: %w", addr, port, err)
+	}
+	close(started) // indicates receiver is setup
+
+	var closeOnce sync.Once
+	closeConn := func() {
+		closeOnce.Do(func() {
+			if err := pconn.Close(); err != nil {
+				r.logError(err)
+			}
+		})
+	}
+
+	done := make(chan struct{})
 	go func() {
 		select {
-		case <-q: // if routine has exited before
-		case <-r.q: // upon general close
+		case <-r.stopCh: // upon general close
+			closeConn()
+		case <-done: // receiver exited early
 		}
-		pconn.Close()
 	}()
-	defer close(q)
+	defer func() {
+		close(done)
+		closeConn()
+	}()
 
 	udpconn, ok := pconn.(*net.UDPConn)
 	if !ok {
-		return err
+		return fmt.Errorf("not a udp connection")
 	}
+
+	return r.receiveRoutine(udpconn)
+}
+
+func (r *UDPReceiver) receiveRoutine(udpconn *net.UDPConn) (err error) {
 	localAddr, _ := udpconn.LocalAddr().(*net.UDPAddr)
 
 	for {
@@ -157,7 +197,7 @@ func (r *UDPReceiver) receive(addr string, port int, started chan bool) error {
 		pkt.size, pkt.src, err = udpconn.ReadFromUDP(pkt.payload)
 		if err != nil {
 			packetPool.Put(pkt)
-			return err
+			return fmt.Errorf("udp read: %w", err)
 		}
 		pkt.dst = localAddr
 		pkt.received = time.Now().UTC()
@@ -171,19 +211,19 @@ func (r *UDPReceiver) receive(addr string, port int, started chan bool) error {
 			// if combined with synchronous mode
 			select {
 			case r.dispatch <- pkt:
-			case <-r.q:
+			case <-r.stopCh:
 				return nil
 			}
 		} else {
 			select {
 			case r.dispatch <- pkt:
-			case <-r.q:
+			case <-r.stopCh:
 				return nil
 			default:
 				if r.cb != nil {
 					r.cb.Dropped(Message{
-						Src:      pkt.src.AddrPort(),
-						Dst:      pkt.dst.AddrPort(),
+						Src:      normalizeAddrPort(pkt.src.AddrPort()),
+						Dst:      normalizeAddrPort(pkt.dst.AddrPort()),
 						Payload:  pkt.payload[0:pkt.size],
 						Received: pkt.received,
 					})
@@ -197,6 +237,7 @@ func (r *UDPReceiver) receive(addr string, port int, started chan bool) error {
 
 }
 
+// ReceiverError wraps errors from UDP receive routines.
 type ReceiverError struct {
 	Err error
 }
@@ -209,22 +250,17 @@ func (e *ReceiverError) Unwrap() error {
 	return e.Err
 }
 
-// Start the processing routines
+// Start the processing routines.
 func (r *UDPReceiver) decoders(workers int, decodeFunc DecoderFunc) error {
 	for i := 0; i < workers; i++ {
-		r.wg.Add(1)
-		r.decodersCnt += 1
+		r.decodeWg.Add(1)
 		go func() {
-			defer r.wg.Done()
+			defer r.decodeWg.Done()
 			for pkt := range r.dispatch {
-
-				if pkt == nil {
-					return
-				}
 				if decodeFunc != nil {
 					msg := Message{
-						Src:      pkt.src.AddrPort(),
-						Dst:      pkt.dst.AddrPort(),
+						Src:      normalizeAddrPort(pkt.src.AddrPort()),
+						Dst:      normalizeAddrPort(pkt.dst.AddrPort()),
 						Payload:  pkt.payload[0:pkt.size],
 						Received: pkt.received,
 					}
@@ -242,24 +278,38 @@ func (r *UDPReceiver) decoders(workers int, decodeFunc DecoderFunc) error {
 	return nil
 }
 
-// Starts the UDP receiving workers
-func (r *UDPReceiver) receivers(sockets int, addr string, port int) error {
+// receivers starts the UDP socket routines.
+func (r *UDPReceiver) receivers(sockets int, addr string, port int) (rErr error) {
 	for i := 0; i < sockets; i++ {
-		r.wg.Add(1)
-		started := make(chan bool)
+		if rErr != nil { // do not instanciate the rest of the receivers
+			break
+		}
+
+		r.recvWg.Add(1)
+		started := make(chan bool) // indicates receiver setup is complete
 		go func() {
-			defer r.wg.Done()
+			defer r.recvWg.Done()
 			if err := r.receive(addr, port, started); err != nil {
-				r.logError(&ReceiverError{err})
+				err = &ReceiverError{err}
+
+				select {
+				case <-started:
+				default: // in case the receiver is not started yet
+					rErr = err
+					close(started)
+					return
+				}
+
+				r.logError(err)
 			}
 		}()
 		<-started
 	}
 
-	return nil
+	return rErr
 }
 
-// Start UDP receivers and the processing routines
+// Start runs UDP receivers and processing routines.
 func (r *UDPReceiver) Start(addr string, port int, decodeFunc DecoderFunc) error {
 	select {
 	case <-r.ready:
@@ -269,27 +319,38 @@ func (r *UDPReceiver) Start(addr string, port int, decodeFunc DecoderFunc) error
 	}
 
 	if err := r.decoders(r.workers, decodeFunc); err != nil {
-		return err
+		if stopErr := r.Stop(); stopErr != nil {
+			return fmt.Errorf("receiver stop after decoder error: %w", stopErr)
+		}
+		return fmt.Errorf("receiver start decoders: %w", err)
 	}
-	if err := r.receivers(r.workers, addr, port); err != nil {
-		return err
+	if err := r.receivers(r.sockets, addr, port); err != nil {
+		if stopErr := r.Stop(); stopErr != nil {
+			return fmt.Errorf("receiver stop after socket error: %w", stopErr)
+		}
+		return fmt.Errorf("receiver start sockets: %w", err)
 	}
 	return nil
 }
 
-// Stops the routines
+// Stop stops the receiver and worker routines.
 func (r *UDPReceiver) Stop() error {
 	select {
-	case <-r.q:
+	case <-r.ready:
+		return fmt.Errorf("receiver is already stopped")
 	default:
-		close(r.q)
 	}
 
-	for i := 0; i < r.decodersCnt; i++ {
-		r.dispatch <- nil
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+	})
+
+	r.recvWg.Wait()
+	close(r.dispatch)
+	r.decodeWg.Wait()
+
+	if err := r.init(); err != nil {
+		return fmt.Errorf("receiver reinit: %w", err)
 	}
-
-	r.wg.Wait()
-
-	return r.init() // recreates the closed channels
+	return nil
 }

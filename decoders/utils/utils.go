@@ -1,27 +1,33 @@
+// Package utils provides decoding helpers shared across flow decoders.
 package utils
 
 import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 )
 
+// BytesBuffer is a minimal buffer interface for decoding helpers.
 type BytesBuffer interface {
 	io.Reader
 	Next(int) []byte
 }
 
+// BinaryDecoder decodes multiple values from the buffer using big-endian encoding.
 func BinaryDecoder(payload *bytes.Buffer, dests ...interface{}) error {
 	for _, dest := range dests {
 		err := BinaryRead(payload, binary.BigEndian, dest)
 		if err != nil {
-			return err
+			return fmt.Errorf("BinaryDecoder: %w", err)
 		}
 	}
 	return nil
 }
+
+// BinaryRead decodes a single value from the buffer using the supplied byte order.
 func BinaryRead(payload BytesBuffer, order binary.ByteOrder, data any) error {
 	// Fast path for basic types and slices.
 	if n := intDataSize(data); n != 0 {
@@ -48,6 +54,13 @@ func BinaryRead(payload BytesBuffer, order binary.ByteOrder, data any) error {
 			*data = int64(order.Uint64(bs))
 		case *uint64:
 			*data = order.Uint64(bs)
+		case *string:
+			strlen := int(order.Uint32(bs))
+			buf := payload.Next(strlen)
+			if len(buf) < strlen {
+				return io.ErrUnexpectedEOF
+			}
+			*data = string(buf)
 		case []bool:
 			for i, x := range bs { // Easier to loop over the input for 8-bit values.
 				data[i] = x != 0
@@ -120,6 +133,8 @@ func intDataSize(data any) int {
 	case []uint16:
 		return 2 * len(data)
 	case int32, uint32, *int32, *uint32:
+		return 4
+	case *string: // return the length field
 		return 4
 	case []int32:
 		return 4 * len(data)

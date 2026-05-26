@@ -3,14 +3,16 @@ package metrics
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/netsampler/goflow2/v2/decoders/netflow"
-	"github.com/netsampler/goflow2/v2/utils"
+	"github.com/netsampler/goflow2/v3/decoders/netflow"
+	"github.com/netsampler/goflow2/v3/utils"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// PromDecoderWrapper wraps a decoder to emit Prometheus metrics.
 func PromDecoderWrapper(wrapped utils.DecoderFunc, name string) utils.DecoderFunc {
 	return func(msg interface{}) error {
 		pkt, ok := msg.(*utils.Message)
@@ -20,7 +22,7 @@ func PromDecoderWrapper(wrapped utils.DecoderFunc, name string) utils.DecoderFun
 		remote := pkt.Src.Addr().Unmap().String()
 		localIP := pkt.Dst.Addr().Unmap().String()
 
-		port := fmt.Sprintf("%d", pkt.Dst.Port())
+		port := strconv.FormatUint(uint64(pkt.Dst.Port()), 10)
 		size := len(pkt.Payload)
 
 		MetricTrafficBytes.With(
@@ -58,7 +60,7 @@ func PromDecoderWrapper(wrapped utils.DecoderFunc, name string) utils.DecoderFun
 			prometheus.Labels{
 				"name": name,
 			}).
-			Observe(float64((timeTrackStop.Sub(timeTrackStart)).Nanoseconds()) / 1000000000)
+			Observe(float64((timeTrackStop.Sub(timeTrackStart)).Nanoseconds()) / 1e9)
 
 		if err != nil {
 			if errors.Is(err, netflow.ErrorTemplateNotFound) {
@@ -80,18 +82,15 @@ func PromDecoderWrapper(wrapped utils.DecoderFunc, name string) utils.DecoderFun
 					Inc()
 			}
 		}
-		return err
+		if err != nil {
+			return fmt.Errorf("decode %s: %w", name, err)
+		}
+		return nil
 	}
 }
 
 func recordCommonNetFlowMetrics(version uint16, key string, flowSets []interface{}) {
-	versionStr := fmt.Sprintf("%d", version)
-	NetFlowStats.With(
-		prometheus.Labels{
-			"router":  key,
-			"version": versionStr,
-		}).
-		Inc()
+	versionStr := strconv.FormatUint(uint64(version), 10)
 
 	for _, fs := range flowSets {
 		switch fsConv := fs.(type) {

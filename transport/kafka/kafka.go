@@ -1,24 +1,33 @@
+// Package kafka implements a Kafka transport using sarama.
 package kafka
 
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/netsampler/goflow2/v2/transport"
+	"github.com/netsampler/goflow2/v3/transport"
 
 	sarama "github.com/Shopify/sarama"
 )
 
+// KafkaDriver sends formatted messages to Kafka topics.
 type KafkaDriver struct {
-	kafkaTLS            bool
+	kafkaTLS         bool
+	kafkaClientCert  string
+	kafkaClientKey   string
+	kafkaServerCA    string
+	kafkaTlsInsecure bool
+
 	kafkaSASL           string
 	kafkaTopic          string
 	kafkaSrv            string
@@ -33,12 +42,10 @@ type KafkaDriver struct {
 
 	producer sarama.AsyncProducer
 
-	q chan bool
-
 	errors chan error
 }
 
-// Error specifically for inner Kafka errors
+// KafkaTransportError wraps errors returned by the Kafka client.
 type KafkaTransportError struct {
 	Err error
 }
@@ -47,9 +54,10 @@ func (e *KafkaTransportError) Error() string {
 	return fmt.Sprintf("kafka transport %s", e.Err.Error())
 }
 func (e *KafkaTransportError) Unwrap() []error {
-	return []error{transport.ErrorTransport, e.Err}
+	return []error{transport.ErrTransport, e.Err}
 }
 
+// KafkaSASLAlgorithm names supported SASL auth mechanisms.
 type KafkaSASLAlgorithm string
 
 const (
@@ -83,6 +91,12 @@ var (
 
 func (d *KafkaDriver) Prepare() error {
 	flag.BoolVar(&d.kafkaTLS, "transport.kafka.tls", false, "Use TLS to connect to Kafka")
+
+	flag.StringVar(&d.kafkaClientCert, "transport.kafka.tls.client", "", "Kafka client certificate")
+	flag.StringVar(&d.kafkaClientKey, "transport.kafka.tls.key", "", "Kafka client key")
+	flag.StringVar(&d.kafkaServerCA, "transport.kafka.tls.ca", "", "Kafka certificate authority")
+	flag.BoolVar(&d.kafkaTlsInsecure, "transport.kafka.tls.insecure", false, "Skips TLS verification")
+
 	flag.StringVar(&d.kafkaSASL, "transport.kafka.sasl", "none",
 		fmt.Sprintf(
 			"Use SASL to connect to Kafka, available settings: %s (TLS is recommended and the environment variables KAFKA_SASL_USER and KAFKA_SASL_PASS need to be set)",
@@ -103,10 +117,12 @@ func (d *KafkaDriver) Prepare() error {
 	return nil
 }
 
+// Errors returns the Kafka producer error channel.
 func (d *KafkaDriver) Errors() <-chan error {
 	return d.errors
 }
 
+// Init configures the Kafka producer and establishes connections.
 func (d *KafkaDriver) Init() error {
 	kafkaConfigVersion, err := sarama.ParseKafkaVersion(d.kafkaVersion)
 	if err != nil {
@@ -151,6 +167,54 @@ func (d *KafkaDriver) Init() error {
 			RootCAs:    rootCAs,
 			MinVersion: tls.VersionTLS12,
 		}
+
+		kafkaConfig.Net.TLS.Config.InsecureSkipVerify = d.kafkaTlsInsecure
+
+		if d.kafkaServerCA != "" {
+			serverCaFile, err := os.Open(d.kafkaServerCA)
+			if err != nil {
+				return fmt.Errorf("error initializing server CA: %v", err)
+			}
+
+			serverCaBytes, err := io.ReadAll(serverCaFile)
+			if err != nil {
+				if closeErr := serverCaFile.Close(); closeErr != nil {
+					return fmt.Errorf("error closing server CA: %v", closeErr)
+				}
+				return fmt.Errorf("error reading server CA: %v", err)
+			}
+			if err := serverCaFile.Close(); err != nil {
+				return fmt.Errorf("error closing server CA: %v", err)
+			}
+
+			block, _ := pem.Decode(serverCaBytes)
+
+			serverCa, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return fmt.Errorf("error parsing server CA: %v", err)
+			}
+
+			certPool := x509.NewCertPool()
+			certPool.AddCert(serverCa)
+
+			kafkaConfig.Net.TLS.Config.RootCAs = certPool
+		}
+
+		if d.kafkaClientCert != "" && d.kafkaClientKey != "" {
+			_, err := tls.LoadX509KeyPair(d.kafkaClientCert, d.kafkaClientKey)
+			if err != nil {
+				return fmt.Errorf("error initializing mTLS: %v", err)
+			}
+
+			kafkaConfig.Net.TLS.Config.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				cert, err := tls.LoadX509KeyPair(d.kafkaClientCert, d.kafkaClientKey)
+				if err != nil {
+					return nil, err
+				}
+				return &cert, nil
+			}
+		}
+
 	}
 
 	if d.kafkaHashing {
@@ -161,25 +225,26 @@ func (d *KafkaDriver) Init() error {
 	if d.kafkaSASL != "" && kafkaSASL != KAFKA_SASL_NONE {
 		_, ok := saslAlgorithms[KafkaSASLAlgorithm(strings.ToLower(d.kafkaSASL))]
 		if !ok {
-			return errors.New("SASL algorithm does not exist")
+			return errors.New("sasl algorithm does not exist")
 		}
 
 		kafkaConfig.Net.SASL.Enable = true
 		kafkaConfig.Net.SASL.User = os.Getenv("KAFKA_SASL_USER")
 		kafkaConfig.Net.SASL.Password = os.Getenv("KAFKA_SASL_PASS")
 		if kafkaConfig.Net.SASL.User == "" && kafkaConfig.Net.SASL.Password == "" {
-			return fmt.Errorf("Kafka SASL config from environment was unsuccessful. KAFKA_SASL_USER and KAFKA_SASL_PASS need to be set.")
+			return fmt.Errorf("kafka SASL config from environment was unsuccessful: KAFKA_SASL_USER and KAFKA_SASL_PASS need to be set")
 		}
 
 		if kafkaSASL == KAFKA_SASL_SCRAM_SHA256 || kafkaSASL == KAFKA_SASL_SCRAM_SHA512 {
 			kafkaConfig.Net.SASL.Handshake = true
 
-			if kafkaSASL == KAFKA_SASL_SCRAM_SHA512 {
+			switch kafkaSASL {
+			case KAFKA_SASL_SCRAM_SHA512:
 				kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
 					return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
 				}
 				kafkaConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-			} else if kafkaSASL == KAFKA_SASL_SCRAM_SHA256 {
+			case KAFKA_SASL_SCRAM_SHA256:
 				kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
 					return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
 				}
@@ -201,33 +266,20 @@ func (d *KafkaDriver) Init() error {
 	}
 	d.producer = kafkaProducer
 
-	d.q = make(chan bool)
-
 	go func() {
-		for {
+		for msg := range kafkaProducer.Errors() {
 			select {
-			case msg := <-kafkaProducer.Errors():
-				var err error
-				if msg != nil {
-					err = &KafkaTransportError{msg}
-				}
-				select {
-				case d.errors <- err:
-				default:
-				}
-
-				if msg == nil {
-					return
-				}
-			case <-d.q:
-				return
+			case d.errors <- &KafkaTransportError{msg}:
+			default:
 			}
 		}
+		close(d.errors)
 	}()
 
 	return err
 }
 
+// Send publishes a message to Kafka.
 func (d *KafkaDriver) Send(key, data []byte) error {
 	d.producer.Input() <- &sarama.ProducerMessage{
 		Topic: d.kafkaTopic,
@@ -237,17 +289,16 @@ func (d *KafkaDriver) Send(key, data []byte) error {
 	return nil
 }
 
+// Close stops the producer and releases resources.
 func (d *KafkaDriver) Close() error {
-	d.producer.Close()
-	close(d.q)
-	return nil
+	return d.producer.Close()
 }
 
-// todo: deprecate?
+// GetServiceAddresses resolves SRV records into broker addresses.
 func GetServiceAddresses(srv string) (addrs []string, err error) {
 	_, srvs, err := net.LookupSRV("", "", srv)
 	if err != nil {
-		return nil, fmt.Errorf("service discovery: %v\n", err)
+		return nil, fmt.Errorf("service discovery: %v", err)
 	}
 	for _, srv := range srvs {
 		addrs = append(addrs, net.JoinHostPort(srv.Target, strconv.Itoa(int(srv.Port))))

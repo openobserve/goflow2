@@ -3,7 +3,7 @@ Notice: This is a fork of https://github.com/netsampler/goflow2 and adds an HTTP
 # GoFlow2
 
 [![Build Status](https://github.com/netsampler/goflow2/workflows/Build/badge.svg)](https://github.com/netsampler/goflow2/actions?query=workflow%3ABuild)
-[![Go Reference](https://pkg.go.dev/badge/github.com/netsampler/goflow2.svg)](https://pkg.go.dev/github.com/netsampler/goflow2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/netsampler/goflow2/v3.svg)](https://pkg.go.dev/github.com/netsampler/goflow2/v3)
 
 This application is a NetFlow/IPFIX/sFlow collector in Go.
 
@@ -48,13 +48,16 @@ functions to marshal as JSON or text for instance.
 The `transport` provides different way of processing the message. Either sending it via Kafka or 
 send it to a file (or stdout).
 
-GoFlow2 is a wrapper of all the functions and chains thems.
+GoFlow2 is a wrapper of all the functions and chains them.
 
 You can build your own collector using this base and replace parts:
 * Use different transport (e.g: RabbitMQ instead of Kafka)
 * Convert to another format (e.g: Cap'n Proto, Avro, instead of protobuf)
 * Decode different samples (e.g: not only IP networks, add MPLS)
 * Different metrics system (e.g: [OpenTelemetry](https://opentelemetry.io/))
+
+The application wiring is organized under `pkg/goflow2` (config, logging, builder, collector,
+httpserver, app) to simplify reuse across binaries (e.g., `cmd/goflow2`, `cmd/enricher`).
 
 ### Protocol difference
 
@@ -65,6 +68,7 @@ The sampling protocols have distinct features:
 
 The sampling rate in NetFlow/IPFIX is provided by **Option Data Sets**. This is why it can take a few minutes
 for the packets to be decoded until all the templates are received (**Option Template** and **Data Template**).
+Sampling rates are cached in the FlowStore with optional TTL and JSON persistence controls (see `sampling.*` flags).
 
 Both of these protocols bundle multiple samples (**Data Set** in NetFlow/IPFIX and **Flow Sample** in sFlow)
 in one packet.
@@ -151,22 +155,22 @@ By default, compression is disabled when sending data to Kafka.
 To change the kafka compression type of the producer side configure the following option:
 
 ```
--transport.kafka.compression.type=gzip
+-transport.kafka.compression=gzip
 ```
 The list of codecs is available in the [Sarama documentation](https://pkg.go.dev/github.com/Shopify/sarama#CompressionCodec).
 
 
-By default, the collector will listen for IPFIX/NetFlow V9 on port 2055
+By default, the collector will listen for IPFIX/NetFlow V9/NetFlow V5 on port 2055
 and sFlow on port 6343.
 To change the sockets binding, you can set the `-listen` argument and a URI
-for each protocol (`netflow`, `sflow` and `nfl` as scheme) separated by a comma.
-For instance, to create 4 parallel sockets of sFlow and one of NetFlow V5, you can use:
+for each protocol (`netflow`, `sflow` or `flow` for both as scheme) separated by a comma.
+For instance, to create 4 parallel sockets of sFlow and one of NetFlow, you can use:
 
 ```bash
-$ ./goflow2 -listen 'sflow://:6343?count=4,nfl://:2055'
+$ ./goflow2 -listen 'sflow://:6343?count=4,netflow://:2055'
 ```
 
-More information about workers and resource usage is avaialble on the [Performance page](/docs/performance.md).
+More information about workers and resource usage is available on the [Performance page](/docs/performance.md).
 
 ### HTTP Endpoint
 

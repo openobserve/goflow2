@@ -1,12 +1,11 @@
 package protoproducer
 
 import (
-	"encoding/hex"
-	"encoding/json"
 	"testing"
 
-	"github.com/netsampler/goflow2/v2/decoders/netflow"
-	"github.com/netsampler/goflow2/v2/decoders/sflow"
+	"github.com/netsampler/goflow2/v3/decoders/netflow"
+	"github.com/netsampler/goflow2/v3/decoders/sflow"
+	"github.com/netsampler/goflow2/v3/utils/store/samplingrate"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -18,6 +17,31 @@ func TestProcessMessageNetFlow(t *testing.T) {
 					Type:  netflow.NFV9_FIELD_IPV4_SRC_ADDR,
 					Value: []byte{10, 0, 0, 1},
 				},
+				netflow.DataField{
+					Type: netflow.NFV9_FIELD_FIRST_SWITCHED,
+					// 218432176
+					Value: []byte{0x0d, 0x05, 0x02, 0xb0},
+				},
+				netflow.DataField{
+					Type: netflow.NFV9_FIELD_LAST_SWITCHED,
+					// 218432192
+					Value: []byte{0x0d, 0x05, 0x02, 0xc0},
+				},
+				netflow.DataField{
+					Type: netflow.NFV9_FIELD_MPLS_LABEL_1,
+					// 24041
+					Value: []byte{0x05, 0xde, 0x94},
+				},
+				netflow.DataField{
+					Type: netflow.NFV9_FIELD_MPLS_LABEL_2,
+					// 211992
+					Value: []byte{0x33, 0xc1, 0x85},
+				},
+				netflow.DataField{
+					Type: netflow.NFV9_FIELD_MPLS_LABEL_3,
+					// 48675
+					Value: []byte{0x0b, 0xe2, 0x35},
+				},
 			},
 		},
 	}
@@ -28,16 +52,29 @@ func TestProcessMessageNetFlow(t *testing.T) {
 	}
 
 	pktnf9 := netflow.NFv9Packet{
-		FlowSets: dfs,
+		SystemUptime: 218432000,
+		UnixSeconds:  1705732882,
+		FlowSets:     dfs,
 	}
-	testsr := &SingleSamplingRateSystem{1}
-	_, err := ProcessMessageNetFlowV9Config(&pktnf9, testsr, nil)
-	assert.Nil(t, err)
+	testsr := samplingrate.NewSamplingRateFlowStore()
+	ctx := netflow.FlowContext{RouterKey: "router1"}
+	_ = testsr.Set(ctx, 9, 0, 1)
+	msgs, err := ProcessMessageNetFlowV9Config(&pktnf9, ctx, testsr, nil)
+	if assert.Nil(t, err) && assert.Len(t, msgs, 1) {
+		msg, ok := msgs[0].(*ProtoProducerMessage)
+		if assert.True(t, ok) {
+			assert.Equal(t, uint64(1), msg.SamplingRate)
+			assert.Equal(t, uint64(1705732882176*1e6), msg.TimeFlowStartNs)
+			assert.Equal(t, uint64(1705732882192*1e6), msg.TimeFlowEndNs)
+			assert.Equal(t, []uint32{24041, 211992, 48675}, msg.MplsLabel)
+		}
+	}
 
 	pktipfix := netflow.IPFIXPacket{
 		FlowSets: dfs,
 	}
-	_, err = ProcessMessageIPFIXConfig(&pktipfix, testsr, nil)
+	_ = testsr.Set(ctx, 10, 0, 1)
+	_, err = ProcessMessageIPFIXConfig(&pktipfix, ctx, testsr, nil)
 	assert.Nil(t, err)
 }
 
@@ -75,8 +112,15 @@ func TestProcessMessageSFlow(t *testing.T) {
 			},
 		},
 	}
-	_, err := ProcessMessageSFlowConfig(&pkt, nil)
-	assert.Nil(t, err)
+	msgs, err := ProcessMessageSFlowConfig(&pkt, nil)
+	if assert.Nil(t, err) && assert.Len(t, msgs, 2) {
+		for _, producerMsg := range msgs {
+			msg, ok := producerMsg.(*ProtoProducerMessage)
+			if assert.True(t, ok) {
+				assert.Equal(t, uint64(1), msg.SamplingRate)
+			}
+		}
+	}
 }
 
 func TestExpandedSFlowDecode(t *testing.T) {
@@ -194,71 +238,23 @@ func getSflowPacket() *sflow.Packet {
 	return &pkt
 }
 
-func TestProcessEthernet(t *testing.T) {
-	dataStr := "005300000001" + // src mac
-		"005300000002" + // dst mac
-		"86dd" + // etype
-		"6000000004d83a40" + // ipv6
-		"fd010000000000000000000000000001" + // src
-		"fd010000000000000000000000000002" + // dst
-		"8000f96508a4" // icmpv6
-	data, _ := hex.DecodeString(dataStr)
+func TestNetFlowV9Time(t *testing.T) {
+	// This test ensures the NetFlow v9 timestamps are properly calculated.
+	// It passes a baseTime = 2024-01-01 00:00:00 (in seconds) and an uptime of 2 seconds  (in milliseconds).
+	// The flow record was logged at 1 second of uptime (in milliseconds).
+	// The calculation is the following: baseTime - uptime + flowUptime.
 	var flowMessage ProtoProducerMessage
-	err := ParseEthernetHeader(&flowMessage, data, nil)
+	err := ConvertNetFlowDataSet(&flowMessage, 9, 1704067200, 2000, []netflow.DataField{
+		netflow.DataField{
+			Type:  netflow.NFV9_FIELD_FIRST_SWITCHED,
+			Value: []byte{0x0, 0x0, 0x03, 0xe8}, // 1000
+		},
+	}, nil, nil)
 	assert.Nil(t, err)
-
-	b, _ := json.Marshal(flowMessage.FlowMessage)
-	t.Log(string(b))
-
-	assert.Equal(t, uint32(0x86dd), flowMessage.Etype)
-	assert.Equal(t, uint32(58), flowMessage.Proto)
-	assert.Equal(t, uint32(128), flowMessage.IcmpType)
+	assert.Equal(t, uint64(1704067199)*1e9, flowMessage.TimeFlowStartNs)
 }
 
-func TestProcessIPv6Headers(t *testing.T) {
-	dataStr := "6000000004d82c40" +
-		"fd010000000000000000000000000001" + // src
-		"fd010000000000000000000000000002" + // dst
-		"3a000001a7882ea9" + // fragment header
-		"8000f96508a4" // icmpv6
-	data, _ := hex.DecodeString(dataStr)
-	var flowMessage ProtoProducerMessage
-	nextHeader, offset, err := ParseIPv6(0, &flowMessage, data)
-	assert.Nil(t, err)
-	assert.Equal(t, byte(44), nextHeader)
-	nextHeader, offset, err = ParseIPv6Headers(nextHeader, offset, &flowMessage, data)
-	assert.Nil(t, err)
-	assert.Equal(t, byte(58), nextHeader)
-
-	offset, err = ParseICMPv6(offset, &flowMessage, data)
-	assert.Nil(t, err)
-
-	b, _ := json.Marshal(flowMessage.FlowMessage)
-	t.Log(string(b), nextHeader, offset)
-
-	assert.Equal(t, uint32(1), flowMessage.IpFlags)
-	assert.Equal(t, uint32(64), flowMessage.IpTtl)
-	assert.Equal(t, uint32(2810719913), flowMessage.FragmentId)
-	assert.Equal(t, uint32(0), flowMessage.FragmentOffset)
-	assert.Equal(t, uint32(128), flowMessage.IcmpType)
-}
-
-func TestProcessIPv4Fragment(t *testing.T) {
-	dataStr := "450002245dd900b94001ffe1" +
-		"c0a80101" + // src
-		"c0a80102" + // dst
-		"0809" // continued payload
-	data, _ := hex.DecodeString(dataStr)
-	var flowMessage ProtoProducerMessage
-	nextHeader, offset, err := ParseIPv4(0, &flowMessage, data)
-	assert.Nil(t, err)
-	assert.Equal(t, byte(1), nextHeader)
-
-	b, _ := json.Marshal(flowMessage.FlowMessage)
-	t.Log(string(b), nextHeader, offset)
-
-	assert.Equal(t, uint32(0), flowMessage.IpFlags)
-	assert.Equal(t, uint32(64), flowMessage.IpTtl)
-	assert.Equal(t, uint32(24025), flowMessage.FragmentId)
-	assert.Equal(t, uint32(185), flowMessage.FragmentOffset)
+func TestConvertNTPEpoch(t *testing.T) {
+	e := ConvertNTPEpoch(0xebe50e38c50cc000)
+	assert.Equal(t, uint64(1748668344769725799), e)
 }
