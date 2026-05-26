@@ -1,13 +1,17 @@
+// Package producer converts decoded packets into output messages.
 package producer
 
 import (
 	"net/netip"
 	"time"
+
+	"github.com/netsampler/goflow2/v3/decoders/netflow"
 )
 
-// Interface of the messages
+// ProducerMessage is the generic type returned by producers.
 type ProducerMessage interface{}
 
+// ProducerInterface converts decoded packets into producer messages.
 type ProducerInterface interface {
 	// Converts a message into a list of flow samples
 	Produce(msg interface{}, args *ProduceArgs) ([]ProducerMessage, error)
@@ -16,9 +20,11 @@ type ProducerInterface interface {
 	Close()
 }
 
+// ProduceArgs captures metadata about the received packet.
 type ProduceArgs struct {
 	Src            netip.AddrPort
 	Dst            netip.AddrPort
 	SamplerAddress netip.Addr
 	TimeReceived   time.Time
+	FlowContext    *netflow.FlowContext
 }

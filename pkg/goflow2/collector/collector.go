@@ -1,0 +1,296 @@
+package collector
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/netsampler/goflow2/v3/decoders/netflow"
+	"github.com/netsampler/goflow2/v3/format"
+	"github.com/netsampler/goflow2/v3/metrics"
+	"github.com/netsampler/goflow2/v3/pkg/goflow2/listen"
+	"github.com/netsampler/goflow2/v3/producer"
+	"github.com/netsampler/goflow2/v3/transport"
+	"github.com/netsampler/goflow2/v3/utils"
+	"github.com/netsampler/goflow2/v3/utils/debug"
+	"github.com/netsampler/goflow2/v3/utils/store/templates"
+)
+
+// Config configures a Collector.
+type Config struct {
+	Listeners     []listen.ListenerConfig
+	Formatter     format.FormatInterface
+	Transport     *transport.Transport
+	Producer      producer.ProducerInterface
+	TemplateStore netflow.ManagedTemplateStore
+	ErrCnt        int
+	ErrInt        time.Duration
+	Logger        *slog.Logger
+}
+
+// Collector manages receivers and flow pipes.
+type Collector struct {
+	listeners []listen.ListenerConfig
+	formatter format.FormatInterface
+	transport *transport.Transport
+	producer  producer.ProducerInterface
+	errCnt    int
+	errInt    time.Duration
+	logger    *slog.Logger
+
+	receivers       []*utils.UDPReceiver
+	pipes           []utils.FlowPipe
+	netflowTemplate *utils.NetFlowPipe
+	templateStore   netflow.ManagedTemplateStore
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+}
+
+// New creates a Collector from config.
+func New(cfg Config) (*Collector, error) {
+	if cfg.Logger == nil {
+		return nil, errors.New("logger is required")
+	}
+	return &Collector{
+		listeners:     cfg.Listeners,
+		formatter:     cfg.Formatter,
+		transport:     cfg.Transport,
+		producer:      cfg.Producer,
+		errCnt:        cfg.ErrCnt,
+		errInt:        cfg.ErrInt,
+		logger:        cfg.Logger,
+		templateStore: cfg.TemplateStore,
+	}, nil
+}
+
+// Start launches receivers and error handlers.
+func (c *Collector) Start() error {
+	c.stopCh = make(chan struct{})
+
+	templateStore := c.templateStore
+	if templateStore == nil {
+		templateStore = templates.NewTemplateFlowStore(
+			templates.WithHooks(metrics.TemplateStoreHooks()),
+		)
+	}
+	templateStore.Start()
+	c.templateStore = templateStore
+
+	type recvErrSource struct {
+		ch     <-chan error
+		logger *slog.Logger
+		bm     *utils.BatchMute
+	}
+	type recvErr struct {
+		err    error
+		logger *slog.Logger
+		bm     *utils.BatchMute
+	}
+	var recvErrCh chan recvErr
+	if len(c.listeners) > 0 {
+		recvErrCh = make(chan recvErr, len(c.listeners))
+	}
+
+	for _, listenCfg := range c.listeners {
+		logAttr := []any{
+			slog.String("scheme", listenCfg.Scheme),
+			slog.String("hostname", listenCfg.Hostname),
+			slog.Int("port", listenCfg.Port),
+			slog.Int("count", listenCfg.NumSockets),
+			slog.Int("workers", listenCfg.NumWorkers),
+			slog.Bool("blocking", listenCfg.Blocking),
+			slog.Int("queue_size", listenCfg.QueueSize),
+		}
+		logger := c.logger.With(logAttr...)
+		logger.Info("starting collection")
+
+		recvCfg := &utils.UDPReceiverConfig{
+			Sockets:          listenCfg.NumSockets,
+			Workers:          listenCfg.NumWorkers,
+			QueueSize:        listenCfg.QueueSize,
+			Blocking:         listenCfg.Blocking,
+			ReceiverCallback: metrics.NewReceiverMetric(),
+		}
+		recv, err := utils.NewUDPReceiver(recvCfg)
+		if err != nil {
+			return fmt.Errorf("collector: init receiver: %w", err)
+		}
+
+		pipeCfg := &utils.PipeConfig{
+			Format:        c.formatter,
+			Transport:     c.transport,
+			Producer:      c.producer,
+			TemplateStore: templateStore,
+		}
+
+		var p utils.FlowPipe
+		switch listenCfg.Scheme {
+		case "sflow":
+			p = utils.NewSFlowPipe(pipeCfg)
+		case "netflow":
+			p = utils.NewNetFlowPipe(pipeCfg)
+		case "flow":
+			p = utils.NewFlowPipe(pipeCfg)
+		default:
+			return fmt.Errorf("scheme does not exist: %s", listenCfg.Scheme)
+		}
+
+		if nfP, ok := p.(*utils.NetFlowPipe); ok {
+			c.netflowTemplate = nfP
+		}
+
+		decodeFunc := p.DecodeFlow
+		decodeFunc = debug.PanicDecoderWrapper(decodeFunc)
+		decodeFunc = metrics.PromDecoderWrapper(decodeFunc, listenCfg.Scheme)
+		c.pipes = append(c.pipes, p)
+
+		bm := utils.NewBatchMute(c.errInt, c.errCnt)
+
+		if err := recv.Start(listenCfg.Hostname, listenCfg.Port, decodeFunc); err != nil {
+			return fmt.Errorf("collector: start receiver %s:%d: %w", listenCfg.Hostname, listenCfg.Port, err)
+		}
+		source := recvErrSource{
+			ch:     recv.Errors(),
+			logger: logger,
+			bm:     bm,
+		}
+		c.wg.Add(1)
+		go func(source recvErrSource) {
+			defer c.wg.Done()
+			for {
+				select {
+				case <-c.stopCh:
+					return
+				case err, ok := <-source.ch:
+					if !ok {
+						return
+					}
+					select {
+					case recvErrCh <- recvErr{
+						err:    err,
+						logger: source.logger,
+						bm:     source.bm,
+					}:
+					case <-c.stopCh:
+						return
+					}
+				}
+			}
+		}(source)
+
+		c.receivers = append(c.receivers, recv)
+	}
+
+	if recvErrCh != nil {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+
+			for {
+				select {
+				case <-c.stopCh:
+					return
+				case recvErr := <-recvErrCh:
+					if errors.Is(recvErr.err, net.ErrClosed) {
+						recvErr.logger.Info("closed receiver")
+						continue
+					}
+					if !errors.Is(recvErr.err, netflow.ErrorTemplateNotFound) && !errors.Is(recvErr.err, debug.ErrPanic) {
+						recvErr.logger.Error("error", slog.String("error", recvErr.err.Error()))
+						continue
+					}
+
+					muted, skipped := recvErr.bm.Increment()
+					if muted && skipped == 0 {
+						recvErr.logger.Warn("too many receiver messages, muting")
+					} else if !muted && skipped > 0 {
+						recvErr.logger.Warn("skipped receiver messages", slog.Int("count", skipped))
+					} else if !muted {
+						attrs := []any{
+							slog.String("error", recvErr.err.Error()),
+						}
+
+						if errors.Is(recvErr.err, netflow.ErrorTemplateNotFound) {
+							recvErr.logger.Warn("template error")
+						} else if errors.Is(recvErr.err, debug.ErrPanic) {
+							var pErrMsg *debug.PanicErrorMessage
+							if errors.As(recvErr.err, &pErrMsg) {
+								attrs = append(attrs,
+									slog.Any("message", pErrMsg.Msg),
+									slog.String("stacktrace", string(pErrMsg.Stacktrace)),
+								)
+							}
+							recvErr.logger.Error("intercepted panic", attrs...)
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+
+		var transportErr <-chan error
+		if transportErrorFct, ok := c.transport.TransportDriver.(interface {
+			Errors() <-chan error
+		}); ok {
+			transportErr = transportErrorFct.Errors()
+		}
+
+		bm := utils.NewBatchMute(c.errInt, c.errCnt)
+
+		for {
+			select {
+			case <-c.stopCh:
+				return
+			case err, ok := <-transportErr:
+				if !ok {
+					return
+				}
+				muted, skipped := bm.Increment()
+				if muted && skipped == 0 {
+					c.logger.Warn("too many transport errors, muting")
+				} else if !muted && skipped > 0 {
+					c.logger.Warn("skipped transport errors", slog.Int("count", skipped))
+				} else if !muted {
+					c.logger.Error("transport error", slog.String("error", err.Error()))
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// Stop stops receivers and pipes, then waits for goroutines.
+func (c *Collector) Stop() {
+	if c.stopCh != nil {
+		close(c.stopCh)
+	}
+
+	for _, recv := range c.receivers {
+		if err := recv.Stop(); err != nil {
+			c.logger.Error("error stopping receiver", slog.String("error", err.Error()))
+		}
+	}
+	for _, pipe := range c.pipes {
+		pipe.Close()
+	}
+	if c.templateStore != nil {
+		c.templateStore.Close()
+	}
+	c.wg.Wait()
+}
+
+// NetFlowTemplates returns templates from the last NetFlow pipe.
+func (c *Collector) NetFlowTemplates() map[string]map[string]interface{} {
+	if c.netflowTemplate == nil {
+		return nil
+	}
+	return c.netflowTemplate.GetTemplatesForAllSources()
+}

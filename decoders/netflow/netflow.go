@@ -1,3 +1,4 @@
+// Package netflow decodes NetFlow v9 and IPFIX packets.
 package netflow
 
 import (
@@ -6,9 +7,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/netsampler/goflow2/v2/decoders/utils"
+	"github.com/netsampler/goflow2/v3/decoders/utils"
 )
 
+// DecoderError wraps a NetFlow decode error with its decoder name.
 type DecoderError struct {
 	Decoder string
 	Err     error
@@ -22,6 +24,7 @@ func (e *DecoderError) Unwrap() error {
 	return e.Err
 }
 
+// FlowError annotates an error with flow metadata.
 type FlowError struct {
 	Version     uint16
 	Type        string
@@ -38,6 +41,7 @@ func (e *FlowError) Unwrap() error {
 	return e.Err
 }
 
+// DecodeNFv9OptionsTemplateSet decodes a v9 options template flow set.
 func DecodeNFv9OptionsTemplateSet(payload *bytes.Buffer) ([]NFv9OptionsTemplateRecord, error) {
 	var records []NFv9OptionsTemplateRecord
 	var err error
@@ -49,7 +53,7 @@ func DecodeNFv9OptionsTemplateSet(payload *bytes.Buffer) ([]NFv9OptionsTemplateR
 			&optsTemplateRecord.OptionLength,
 		)
 		if err != nil {
-			return records, err
+			return records, fmt.Errorf("NFv9OptionsTemplateSet: header [%w]", err)
 		}
 
 		sizeScope := int(optsTemplateRecord.ScopeLength) / 4
@@ -81,25 +85,30 @@ func DecodeNFv9OptionsTemplateSet(payload *bytes.Buffer) ([]NFv9OptionsTemplateR
 		records = append(records, optsTemplateRecord)
 	}
 
-	return records, err
+	return records, nil
 }
 
+// DecodeField decodes a field and optional enterprise number.
 func DecodeField(payload *bytes.Buffer, field *Field, pen bool) error {
 	if err := utils.BinaryDecoder(payload,
 		&field.Type,
 		&field.Length,
 	); err != nil {
-		return err
+		return fmt.Errorf("DecodeField: header [%w]", err)
 	}
 	if pen && field.Type&0x8000 != 0 {
 		field.PenProvided = true
-		return utils.BinaryDecoder(payload,
+		if err := utils.BinaryDecoder(payload,
 			&field.Pen,
-		)
+		); err != nil {
+			return fmt.Errorf("DecodeField: pen [%w]", err)
+		}
+		return nil
 	}
 	return nil
 }
 
+// DecodeIPFIXOptionsTemplateSet decodes an IPFIX options template flow set.
 func DecodeIPFIXOptionsTemplateSet(payload *bytes.Buffer) ([]IPFIXOptionsTemplateRecord, error) {
 	var records []IPFIXOptionsTemplateRecord
 	var err error
@@ -143,6 +152,7 @@ func DecodeIPFIXOptionsTemplateSet(payload *bytes.Buffer) ([]IPFIXOptionsTemplat
 	return records, nil
 }
 
+// DecodeTemplateSet decodes a template flow set for NetFlow v9 or IPFIX.
 func DecodeTemplateSet(version uint16, payload *bytes.Buffer) ([]TemplateRecord, error) {
 	var records []TemplateRecord
 	var err error
@@ -187,6 +197,7 @@ func DecodeTemplateSet(version uint16, payload *bytes.Buffer) ([]TemplateRecord,
 	return records, nil
 }
 
+// GetTemplateSize returns the total byte length of a template's fixed fields.
 func GetTemplateSize(version uint16, template []Field) int {
 	sum := 0
 	for _, templateField := range template {
@@ -211,13 +222,13 @@ func DecodeDataSetUsingFields(version uint16, payload *bytes.Buffer, listFields 
 				if err := utils.BinaryDecoder(payload,
 					&variableLen8,
 				); err != nil {
-					return nil, err
+					return nil, fmt.Errorf("DataSet: variable length header [%w]", err)
 				}
 				if variableLen8 == 0xff {
 					if err := utils.BinaryDecoder(payload,
 						&variableLen16,
 					); err != nil {
-						return nil, err
+						return nil, fmt.Errorf("DataSet: extended variable length [%w]", err)
 					}
 					finalLength = int(variableLen16)
 				} else {
@@ -283,12 +294,13 @@ func DecodeDataSet(version uint16, payload *bytes.Buffer, listFields []Field) ([
 	return records, nil
 }
 
-func DecodeMessageCommon(payload *bytes.Buffer, templates NetFlowTemplateSystem, obsDomainId uint32, size, version uint16) (flowSets []interface{}, err error) {
+func DecodeMessageCommon(payload *bytes.Buffer, store TemplateStore, ctx FlowContext, obsDomainId uint32, size, version uint16) (flowSets []interface{}, err error) {
 	var read int
 	startSize := payload.Len()
-	for i := 0; ((i < int(size) && version == 9) || (uint16(read) < size && version == 10)) && payload.Len() > 0; i++ {
-		if flowSet, lerr := DecodeMessageCommonFlowSet(payload, templates, obsDomainId, version); lerr != nil && !errors.Is(lerr, ErrorTemplateNotFound) {
-			return flowSets, lerr
+	headerSize := binary.Size(FlowSetHeader{})
+	for i := 0; payload.Len() >= headerSize && (version == 9 || uint16(read) < size); i++ {
+		if flowSet, lerr := DecodeMessageCommonFlowSet(payload, store, ctx, obsDomainId, version); lerr != nil && !errors.Is(lerr, ErrorTemplateNotFound) {
+			return flowSets, fmt.Errorf("DecodeMessageCommon: %w", lerr)
 		} else {
 			flowSets = append(flowSets, flowSet)
 			if lerr != nil {
@@ -297,10 +309,13 @@ func DecodeMessageCommon(payload *bytes.Buffer, templates NetFlowTemplateSystem,
 		}
 		read = startSize - payload.Len()
 	}
-	return flowSets, err
+	if err != nil {
+		return flowSets, fmt.Errorf("DecodeMessageCommon: %w", err)
+	}
+	return flowSets, nil
 }
 
-func DecodeMessageCommonFlowSet(payload *bytes.Buffer, templates NetFlowTemplateSystem, obsDomainId uint32, version uint16) (flowSet interface{}, err error) {
+func DecodeMessageCommonFlowSet(payload *bytes.Buffer, store TemplateStore, ctx FlowContext, obsDomainId uint32, version uint16) (flowSet interface{}, err error) {
 	fsheader := FlowSetHeader{}
 	if err := utils.BinaryDecoder(payload,
 		&fsheader.Id,
@@ -327,9 +342,9 @@ func DecodeMessageCommonFlowSet(payload *bytes.Buffer, templates NetFlowTemplate
 
 		flowSet = templatefs
 
-		if templates != nil {
+		if store != nil {
 			for _, record := range records {
-				if err := templates.AddTemplate(version, obsDomainId, record.TemplateId, record); err != nil {
+				if _, err := store.AddTemplate(ctx, version, obsDomainId, record.TemplateId, record); err != nil {
 					return flowSet, &FlowError{version, "FlowSet", obsDomainId, fsheader.Id, err}
 				}
 			}
@@ -347,9 +362,9 @@ func DecodeMessageCommonFlowSet(payload *bytes.Buffer, templates NetFlowTemplate
 		}
 		flowSet = optsTemplatefs
 
-		if templates != nil {
+		if store != nil {
 			for _, record := range records {
-				if err := templates.AddTemplate(version, obsDomainId, record.TemplateId, record); err != nil {
+				if _, err := store.AddTemplate(ctx, version, obsDomainId, record.TemplateId, record); err != nil {
 					return flowSet, &FlowError{version, "OptionsTemplateSet", obsDomainId, fsheader.Id, err}
 				}
 			}
@@ -367,9 +382,9 @@ func DecodeMessageCommonFlowSet(payload *bytes.Buffer, templates NetFlowTemplate
 		}
 		flowSet = templatefs
 
-		if templates != nil {
+		if store != nil {
 			for _, record := range records {
-				if err := templates.AddTemplate(version, obsDomainId, record.TemplateId, record); err != nil {
+				if _, err := store.AddTemplate(ctx, version, obsDomainId, record.TemplateId, record); err != nil {
 					return flowSet, &FlowError{version, "IPFIX TemplateSet", obsDomainId, fsheader.Id, err}
 				}
 			}
@@ -387,9 +402,9 @@ func DecodeMessageCommonFlowSet(payload *bytes.Buffer, templates NetFlowTemplate
 		}
 		flowSet = optsTemplatefs
 
-		if templates != nil {
+		if store != nil {
 			for _, record := range records {
-				if err := templates.AddTemplate(version, obsDomainId, record.TemplateId, record); err != nil {
+				if _, err := store.AddTemplate(ctx, version, obsDomainId, record.TemplateId, record); err != nil {
 					return flowSet, &FlowError{version, "IPFIX OptionsTemplateSet", obsDomainId, fsheader.Id, err}
 				}
 			}
@@ -403,11 +418,11 @@ func DecodeMessageCommonFlowSet(payload *bytes.Buffer, templates NetFlowTemplate
 		flowSet = rawfs
 		dataReader := bytes.NewBuffer(rawfs.Records)
 
-		if templates == nil {
-			return flowSet, &FlowError{version, "Templates", obsDomainId, fsheader.Id, fmt.Errorf("No templates")}
+		if store == nil {
+			return flowSet, &FlowError{version, "Templates", obsDomainId, fsheader.Id, fmt.Errorf("no templates")}
 		}
 
-		template, err := templates.GetTemplate(version, obsDomainId, fsheader.Id)
+		template, err := store.GetTemplate(ctx, version, obsDomainId, fsheader.Id)
 		if err != nil {
 			return flowSet, &FlowError{version, "Decode", obsDomainId, fsheader.Id, err}
 		}
@@ -450,10 +465,13 @@ func DecodeMessageCommonFlowSet(payload *bytes.Buffer, templates NetFlowTemplate
 	} else {
 		return flowSet, &FlowError{version, "Decode", obsDomainId, fsheader.Id, fmt.Errorf("ID error")}
 	}
-	return flowSet, err
+	if err != nil {
+		return flowSet, fmt.Errorf("FlowSet decode: %w", err)
+	}
+	return flowSet, nil
 }
 
-func DecodeMessageNetFlow(payload *bytes.Buffer, templates NetFlowTemplateSystem, packetNFv9 *NFv9Packet) error {
+func DecodeMessageNetFlow(payload *bytes.Buffer, store TemplateStore, ctx FlowContext, packetNFv9 *NFv9Packet) error {
 	packetNFv9.Version = 9
 	if err := utils.BinaryDecoder(payload,
 		&packetNFv9.Count,
@@ -467,7 +485,7 @@ func DecodeMessageNetFlow(payload *bytes.Buffer, templates NetFlowTemplateSystem
 	/*size = packetNFv9.Count
 	packetNFv9.Version = version
 	obsDomainId = packetNFv9.SourceId*/
-	flowSets, err := DecodeMessageCommon(payload, templates, packetNFv9.SourceId, packetNFv9.Count, 9)
+	flowSets, err := DecodeMessageCommon(payload, store, ctx, packetNFv9.SourceId, packetNFv9.Count, 9)
 	packetNFv9.FlowSets = flowSets
 	if err != nil {
 		return &DecoderError{"NetFlowV9", err}
@@ -475,7 +493,7 @@ func DecodeMessageNetFlow(payload *bytes.Buffer, templates NetFlowTemplateSystem
 	return nil
 }
 
-func DecodeMessageIPFIX(payload *bytes.Buffer, templates NetFlowTemplateSystem, packetIPFIX *IPFIXPacket) error {
+func DecodeMessageIPFIX(payload *bytes.Buffer, store TemplateStore, ctx FlowContext, packetIPFIX *IPFIXPacket) error {
 	packetIPFIX.Version = 10
 	if err := utils.BinaryDecoder(payload,
 		&packetIPFIX.Length,
@@ -488,7 +506,7 @@ func DecodeMessageIPFIX(payload *bytes.Buffer, templates NetFlowTemplateSystem, 
 	/*size = packetIPFIX.Length
 	packetIPFIX.Version = version
 	obsDomainId = packetIPFIX.ObservationDomainId*/
-	flowSets, err := DecodeMessageCommon(payload, templates, packetIPFIX.ObservationDomainId, packetIPFIX.Length-16, 10)
+	flowSets, err := DecodeMessageCommon(payload, store, ctx, packetIPFIX.ObservationDomainId, packetIPFIX.Length-16, 10)
 	packetIPFIX.FlowSets = flowSets
 	if err != nil {
 		return &DecoderError{"IPFIX", err}
@@ -496,7 +514,7 @@ func DecodeMessageIPFIX(payload *bytes.Buffer, templates NetFlowTemplateSystem, 
 	return nil
 }
 
-func DecodeMessageVersion(payload *bytes.Buffer, templates NetFlowTemplateSystem, packetNFv9 *NFv9Packet, packetIPFIX *IPFIXPacket) error {
+func DecodeMessageVersion(payload *bytes.Buffer, store TemplateStore, ctx FlowContext, packetNFv9 *NFv9Packet, packetIPFIX *IPFIXPacket) error {
 	var version uint16
 
 	if err := utils.BinaryDecoder(payload,
@@ -505,13 +523,14 @@ func DecodeMessageVersion(payload *bytes.Buffer, templates NetFlowTemplateSystem
 		return &DecoderError{"IPFIX/NetFlowV9 version", err}
 	}
 
-	if version == 9 {
-		if err := DecodeMessageNetFlow(payload, templates, packetNFv9); err != nil {
+	switch version {
+	case 9:
+		if err := DecodeMessageNetFlow(payload, store, ctx, packetNFv9); err != nil {
 			return &DecoderError{"NetFlowV9", err}
 		}
 		return nil
-	} else if version == 10 {
-		if err := DecodeMessageIPFIX(payload, templates, packetIPFIX); err != nil {
+	case 10:
+		if err := DecodeMessageIPFIX(payload, store, ctx, packetIPFIX); err != nil {
 			return &DecoderError{"IPFIX", err}
 		}
 		return nil

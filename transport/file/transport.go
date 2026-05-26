@@ -1,25 +1,29 @@
+// Package file implements a file/stdout transport.
 package file
 
 import (
 	"flag"
 	"fmt"
-	"github.com/netsampler/goflow2/v2/transport"
 	"io"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+
+	"github.com/netsampler/goflow2/v3/transport"
 )
 
+// FileDriver writes formatted messages to stdout or a file.
 type FileDriver struct {
 	fileDestination string
 	lineSeparator   string
 	w               io.Writer
 	file            *os.File
 	lock            *sync.RWMutex
-	q               chan bool
+	reloadCh        chan os.Signal
 }
 
+// Prepare registers flags for file transport configuration.
 func (d *FileDriver) Prepare() error {
 	flag.StringVar(&d.fileDestination, "transport.file", "", "File/console output (empty for stdout)")
 	flag.StringVar(&d.lineSeparator, "transport.file.sep", "\n", "Line separator")
@@ -30,16 +34,15 @@ func (d *FileDriver) Prepare() error {
 func (d *FileDriver) openFile() error {
 	file, err := os.OpenFile(d.fileDestination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return err
+		return fmt.Errorf("open file %s: %w", d.fileDestination, err)
 	}
 	d.file = file
 	d.w = d.file
-	return err
+	return nil
 }
 
+// Init initializes the output destination and reload handling.
 func (d *FileDriver) Init() error {
-	d.q = make(chan bool, 1)
-
 	if d.fileDestination == "" {
 		d.w = os.Stdout
 	} else {
@@ -49,50 +52,70 @@ func (d *FileDriver) Init() error {
 		err = d.openFile()
 		d.lock.Unlock()
 		if err != nil {
-			return err
+			return fmt.Errorf("file transport init: %w", err)
 		}
 
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, syscall.SIGHUP)
+		d.reloadCh = make(chan os.Signal, 1)
+		signal.Notify(d.reloadCh, syscall.SIGHUP)
+		reloadCh := d.reloadCh
 		go func() {
 			for {
-				select {
-				case <-c:
-					d.lock.Lock()
-					d.file.Close()
-					err := d.openFile()
-					d.lock.Unlock()
-					if err != nil {
-						return
-					}
-					// if there is an error, keeps using the old file
-				case <-d.q:
+				if _, ok := <-reloadCh; !ok {
 					return
 				}
+				d.lock.Lock()
+				if err := d.file.Close(); err != nil {
+					d.lock.Unlock()
+					return
+				}
+				err := d.openFile()
+				d.lock.Unlock()
+				if err != nil {
+					return
+				}
+				// if there is an error, keeps using the old file
 			}
 		}()
-
 	}
 	return nil
 }
 
+// Send writes a formatted message and separator to the destination.
 func (d *FileDriver) Send(key, data []byte) error {
 	d.lock.RLock()
 	w := d.w
 	d.lock.RUnlock()
-	_, err := fmt.Fprint(w, string(data)+d.lineSeparator)
-	return err
+	if len(data) > 0 {
+		if _, err := w.Write(data); err != nil {
+			return fmt.Errorf("write message: %w", err)
+		}
+	}
+	if d.lineSeparator == "" {
+		return nil
+	}
+	_, err := w.Write([]byte(d.lineSeparator))
+	if err != nil {
+		return fmt.Errorf("write separator: %w", err)
+	}
+	return nil
 }
 
+// Close closes the output file and stops reload handling.
 func (d *FileDriver) Close() error {
+	var closeErr error
 	if d.fileDestination != "" {
 		d.lock.Lock()
-		d.file.Close()
+		if err := d.file.Close(); err != nil {
+			closeErr = fmt.Errorf("close output file: %w", err)
+		}
 		d.lock.Unlock()
-		signal.Ignore(syscall.SIGHUP)
+		if d.reloadCh != nil {
+			signal.Stop(d.reloadCh)
+			close(d.reloadCh)
+			d.reloadCh = nil
+		}
 	}
-	close(d.q)
-	return nil
+	return closeErr
 }
 
 func init() {

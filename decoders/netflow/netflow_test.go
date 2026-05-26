@@ -2,13 +2,87 @@ package netflow
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
+type testTemplateStore struct {
+	mu        sync.RWMutex
+	templates map[string]FlowBaseTemplateSet
+}
+
+func newTestTemplateStore() *testTemplateStore {
+	return &testTemplateStore{
+		templates: make(map[string]FlowBaseTemplateSet),
+	}
+}
+
+func (s *testTemplateStore) AddTemplate(ctx FlowContext, version uint16, obsDomainId uint32, templateId uint16, template interface{}) (TemplateStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := templateKey(version, obsDomainId, templateId)
+	bucket := s.templates[ctx.RouterKey]
+	if bucket == nil {
+		bucket = make(FlowBaseTemplateSet)
+		s.templates[ctx.RouterKey] = bucket
+	}
+	if _, ok := bucket[key]; ok {
+		bucket[key] = template
+		return TemplateUpdated, nil
+	}
+	bucket[key] = template
+	return TemplateAdded, nil
+}
+
+func (s *testTemplateStore) GetTemplate(ctx FlowContext, version uint16, obsDomainId uint32, templateId uint16) (interface{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key := templateKey(version, obsDomainId, templateId)
+	if bucket, ok := s.templates[ctx.RouterKey]; ok {
+		if tpl, ok := bucket[key]; ok {
+			return tpl, nil
+		}
+	}
+	return nil, ErrorTemplateNotFound
+}
+
+func (s *testTemplateStore) RemoveTemplate(ctx FlowContext, version uint16, obsDomainId uint32, templateId uint16) (interface{}, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := templateKey(version, obsDomainId, templateId)
+	bucket, ok := s.templates[ctx.RouterKey]
+	if !ok {
+		return nil, false, ErrorTemplateNotFound
+	}
+	if tpl, ok := bucket[key]; ok {
+		delete(bucket, key)
+		return tpl, true, nil
+	}
+	return nil, false, ErrorTemplateNotFound
+}
+
+func (s *testTemplateStore) GetAll() map[string]FlowBaseTemplateSet {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]FlowBaseTemplateSet, len(s.templates))
+	for k, v := range s.templates {
+		cp := make(FlowBaseTemplateSet, len(v))
+		for kk, vv := range v {
+			cp[kk] = vv
+		}
+		out[k] = cp
+	}
+	return out
+}
+
+func (s *testTemplateStore) Start() {}
+func (s *testTemplateStore) Close() {}
+
 func TestDecodeNetFlowV9(t *testing.T) {
-	templates := CreateTemplateSystem()
+	store := newTestTemplateStore()
+	ctx := FlowContext{RouterKey: "router1"}
 
 	// Decode a template
 	template := []byte{
@@ -23,7 +97,7 @@ func TestDecodeNetFlowV9(t *testing.T) {
 	}
 	buf := bytes.NewBuffer(template)
 	var decNfv9 NFv9Packet
-	err := DecodeMessageVersion(buf, templates, &decNfv9, nil)
+	err := DecodeMessageVersion(buf, store, ctx, &decNfv9, nil)
 	assert.Nil(t, err)
 	assert.Equal(t,
 		NFv9Packet{
@@ -206,7 +280,7 @@ func TestDecodeNetFlowV9(t *testing.T) {
 	}
 	buf = bytes.NewBuffer(data[:89]) // truncate: we don't want to test for everything
 	decNfv9 = NFv9Packet{}           // reset
-	err = DecodeMessageVersion(buf, templates, &decNfv9, nil)
+	err = DecodeMessageVersion(buf, store, ctx, &decNfv9, nil)
 
 	assert.Nil(t, err)
 	assert.Equal(t,
@@ -412,4 +486,30 @@ func TestDecodeNetFlowV9(t *testing.T) {
             - 22. Unassigned (235): [96 0 0 0]
 `,
 		decNfv9.String())
+}
+
+func TestDecodeNetFlowV9IgnoresTrailingPadding(t *testing.T) {
+	store := newTestTemplateStore()
+	ctx := FlowContext{RouterKey: "router1"}
+
+	packet := []byte{
+		0x00, 0x09, 0x00, 0x17, 0xb3, 0xbf, 0xf6, 0x83, 0x61, 0x8a, 0xa3, 0xa8, 0x32, 0x01, 0xee, 0x98,
+		0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x64, 0x01, 0x04, 0x00, 0x17, 0x00, 0x02, 0x00, 0x04,
+		0x00, 0x01, 0x00, 0x04, 0x00, 0x08, 0x00, 0x04, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x0a, 0x00, 0x04,
+		0x00, 0x0e, 0x00, 0x04, 0x00, 0x15, 0x00, 0x04, 0x00, 0x16, 0x00, 0x04, 0x00, 0x07, 0x00, 0x02,
+		0x00, 0x0b, 0x00, 0x02, 0x00, 0x10, 0x00, 0x04, 0x00, 0x11, 0x00, 0x04, 0x00, 0x12, 0x00, 0x04,
+		0x00, 0x09, 0x00, 0x01, 0x00, 0x0d, 0x00, 0x01, 0x00, 0x04, 0x00, 0x01, 0x00, 0x06, 0x00, 0x01,
+		0x00, 0x05, 0x00, 0x01, 0x00, 0x3d, 0x00, 0x01, 0x00, 0x59, 0x00, 0x01, 0x00, 0x30, 0x00, 0x02,
+		0x00, 0xea, 0x00, 0x04, 0x00, 0xeb, 0x00, 0x04,
+	}
+	packet = append(packet, 0x00)
+
+	buf := bytes.NewBuffer(packet)
+	var decNfv9 NFv9Packet
+	err := DecodeMessageVersion(buf, store, ctx, &decNfv9, nil)
+	assert.NoError(t, err)
+	assert.Len(t, decNfv9.FlowSets, 1)
+	assert.Equal(t, uint16(23), decNfv9.Count)
+	assert.Equal(t, FlowSetHeader{Id: 0, Length: 100}, decNfv9.FlowSets[0].(TemplateFlowSet).FlowSetHeader)
+	assert.Len(t, decNfv9.FlowSets[0].(TemplateFlowSet).Records, 1)
 }

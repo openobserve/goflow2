@@ -1,22 +1,25 @@
 package debug
 
 import (
+	"fmt"
 	"runtime/debug"
 
-	"github.com/netsampler/goflow2/v2/utils"
+	"github.com/netsampler/goflow2/v3/utils"
 )
 
+// PanicDecoderWrapper wraps a decoder to recover panics as errors.
 func PanicDecoderWrapper(wrapped utils.DecoderFunc) utils.DecoderFunc {
 	return func(msg interface{}) (err error) {
-
 		defer func() {
 			if pErr := recover(); pErr != nil {
-
 				pErrC, _ := pErr.(string)
 				err = &PanicErrorMessage{Msg: msg, Inner: pErrC, Stacktrace: debug.Stack()}
 			}
 		}()
 		err = wrapped(msg)
-		return err
+		if err != nil {
+			return fmt.Errorf("decoder panic wrapper: %w", err)
+		}
+		return nil
 	}
 }

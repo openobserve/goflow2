@@ -4,14 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"log/slog"
 	"math"
 	"net/http"
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
-	"github.com/netsampler/goflow2/v2/transport"
+	"github.com/netsampler/goflow2/v3/transport"
 )
 
 type HTTPDriver struct {
@@ -80,13 +79,13 @@ func (d *HTTPDriver) Send(key, data []byte) error {
 				resp, err := client.Do(req)
 				if err != nil || (resp.StatusCode < 200 || resp.StatusCode >= 300) {
 					if i == maxRetries-1 {
-						log.Error(err)
+						slog.Error("http transport send failed", slog.Any("error", err))
 						return
 					}
 					time.Sleep(delay * time.Duration(math.Pow(2, float64(i)))) // exponential backoff
 					continue
 				}
-				defer resp.Body.Close()
+				defer func() { _ = resp.Body.Close() }()
 
 				// reset batchData
 				d.batchData = d.batchData[:0]

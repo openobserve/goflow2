@@ -1,12 +1,14 @@
+// Package netflowlegacy decodes NetFlow v5 packets.
 package netflowlegacy
 
 import (
 	"bytes"
 	"fmt"
 
-	"github.com/netsampler/goflow2/v2/decoders/utils"
+	"github.com/netsampler/goflow2/v3/decoders/utils"
 )
 
+// DecoderError wraps a NetFlow legacy decode error.
 type DecoderError struct {
 	Err error
 }
@@ -19,10 +21,11 @@ func (e *DecoderError) Unwrap() error {
 	return e.Err
 }
 
+// DecodeMessageVersion reads the version and decodes a NetFlow v5 message.
 func DecodeMessageVersion(payload *bytes.Buffer, packet *PacketNetFlowV5) error {
 	var version uint16
 	if err := utils.BinaryDecoder(payload, &version); err != nil {
-		return err
+		return &DecoderError{fmt.Errorf("version [%w]", err)}
 	}
 	packet.Version = version
 	if packet.Version != 5 {
@@ -31,6 +34,7 @@ func DecodeMessageVersion(payload *bytes.Buffer, packet *PacketNetFlowV5) error 
 	return DecodeMessage(payload, packet)
 }
 
+// DecodeMessage decodes the NetFlow v5 header and records from the payload.
 func DecodeMessage(payload *bytes.Buffer, packet *PacketNetFlowV5) error {
 	if err := utils.BinaryDecoder(payload,
 		&packet.Count,
@@ -42,7 +46,7 @@ func DecodeMessage(payload *bytes.Buffer, packet *PacketNetFlowV5) error {
 		&packet.EngineId,
 		&packet.SamplingInterval,
 	); err != nil {
-		return &DecoderError{err}
+		return &DecoderError{fmt.Errorf("header [%w]", err)}
 	}
 
 	packet.Records = make([]RecordsNetFlowV5, int(packet.Count)) // maximum is 65535 which would be 3MB
@@ -72,7 +76,7 @@ func DecodeMessage(payload *bytes.Buffer, packet *PacketNetFlowV5) error {
 			&record.DstMask,
 			&record.Pad2,
 		); err != nil {
-			return &DecoderError{err}
+			return &DecoderError{fmt.Errorf("record:%d [%w]", i, err)}
 		}
 		record.SrcAddr = IPAddress(srcAddr)
 		record.DstAddr = IPAddress(dstAddr)
