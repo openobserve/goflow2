@@ -85,7 +85,7 @@ func (d *HTTPDriver) Send(key, data []byte) error {
 					time.Sleep(delay * time.Duration(math.Pow(2, float64(i)))) // exponential backoff
 					continue
 				}
-				defer resp.Body.Close()
+				defer func() { _ = resp.Body.Close() }()
 
 				// reset batchData
 				d.batchData = d.batchData[:0]
